@@ -1,0 +1,168 @@
+use bluetui::{
+    app::{App, AppResult},
+    cli,
+    config::Config,
+    event::{Event, EventHandler},
+    handler::handle_key_events,
+    rfkill,
+    tui::Tui,
+};
+use ratatui::{Terminal, backend::CrosstermBackend};
+use std::{io, path::PathBuf, process::exit, sync::Arc};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> AppResult<()> {
+    let args = cli::cli().get_matches();
+
+    let _ = rfkill::check();
+
+    let custom_config_file = args.get_one::<PathBuf>("config");
+
+    let mut config = Config::new(custom_config_file);
+    config.ascii = args.get_flag("ascii");
+    let config = Arc::new(config);
+
+    let backend = CrosstermBackend::new(io::stdout());
+    let terminal = Terminal::new(backend)?;
+    let events = EventHandler::new(1_000);
+    let mut tui = Tui::new(terminal, events);
+
+    tui.init()?;
+
+    let mut app = match App::new(config.clone(), tui.events.sender.clone()).await {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("{e}");
+            tui.exit()?;
+            return Ok(());
+        }
+    };
+
+    let mut exit_error_message = None;
+
+    while app.running {
+        tui.draw(&mut app)?;
+        match tui.events.next().await? {
+            Event::Tick => {
+                if let Err(e) = app.tick().await {
+                    exit_error_message = Some(e);
+                    break;
+                }
+            }
+            Event::Key(key_event) => {
+                if let Err(e) = handle_key_events(
+                    key_event,
+                    &mut app,
+                    tui.events.sender.clone(),
+                    config.clone(),
+                )
+                .await
+                {
+                    exit_error_message = Some(e);
+                    break;
+                }
+            }
+            Event::Notification(notification) => {
+                app.notifications.push(notification);
+            }
+            Event::NewPairedDevice(address) => {
+                if app
+                    .requests
+                    .display_passkey
+                    .as_ref()
+                    .is_some_and(|req| req.device == address)
+                {
+                    app.requests.display_passkey = None;
+                }
+
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::ToggleFavorite(address) => {
+                if let Some(pos) = app
+                    .favorite_devices
+                    .iter()
+                    .position(|favorite| *favorite == address)
+                {
+                    app.favorite_devices.swap_remove(pos);
+                } else {
+                    app.favorite_devices.push(address);
+                }
+            }
+
+            Event::RequestConfirmation(request) => {
+                app.requests.init_confirmation(request);
+                app.focused_block = bluetui::app::FocusedBlock::RequestConfirmation;
+            }
+
+            Event::ConfirmationSubmitted => {
+                app.requests.confirmation = None;
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::RequestEnterPinCode(request) => {
+                app.requests.init_enter_pin_code(request);
+                app.focused_block = bluetui::app::FocusedBlock::EnterPinCode;
+            }
+
+            Event::PinCodeSumitted => {
+                app.requests.enter_pin_code = None;
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::RequestEnterPasskey(request) => {
+                app.requests.init_enter_passkey(request);
+                app.focused_block = bluetui::app::FocusedBlock::EnterPasskey;
+            }
+
+            Event::PasskeySumitted => {
+                app.requests.enter_passkey = None;
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::RequestDisplayPinCode(request) => {
+                app.requests.init_display_pin_code(request);
+                app.focused_block = bluetui::app::FocusedBlock::DisplayPinCode;
+            }
+
+            Event::DisplayPinCodeSeen => {
+                app.requests.display_pin_code = None;
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::RequestDisplayPasskey(request) => {
+                app.requests.init_display_passkey(request);
+                app.focused_block = bluetui::app::FocusedBlock::DisplayPasskey;
+            }
+
+            Event::DisplayPasskeyCanceled => {
+                app.requests.display_passkey = None;
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::FailedPairing(address) => {
+                if app
+                    .requests
+                    .display_passkey
+                    .as_ref()
+                    .is_some_and(|req| req.device == address)
+                {
+                    app.requests.display_passkey = None;
+                }
+
+                app.focused_block = bluetui::app::FocusedBlock::PairedDevices;
+            }
+
+            Event::Mouse(_) | Event::Resize(_, _) => {}
+        }
+    }
+
+    tui.exit()?;
+
+    if let Some(error) = exit_error_message {
+        eprintln!("{}", error);
+        exit(1);
+    }
+
+    Ok(())
+}
